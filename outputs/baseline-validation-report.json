@@ -1,0 +1,14 @@
+{
+  "mode": "league-preview",
+  "league": "spanyol",
+  "version": "baseline-v1",
+  "dataVersionId": "9cc48a8b-8de5-41d6-98b1-3bc16bccb11d",
+  "parameterSnapshotId": "9afa044c-a12b-434e-a210-b68606585e7b",
+  "inputFingerprint": "546463c9c5f53a8caf52c951671d0b2e:8e636ea611a0e25b75475c815ce541e2",
+  "durationMs": 317213,
+  "featureCount": 9840,
+  "predictionCount": 9840,
+  "teamStateCount": 16,
+  "calibrationCount": 6,
+  "generatedAt": "2026-09-22T15:47:26.227Z"
+}
