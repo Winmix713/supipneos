@@ -7,21 +7,15 @@ tartalmazza. A szkripteket a Supabase SQL Editorban kell lefuttatni.
 
 ---
 
-## 1. RLS policy ütközések megszüntetése
+## 1. RLS policy ütközések — már javítva
 
-A `winmix_seasons`, `winmix_matches` és `winmix_pipeline_checkpoints` táblákon
-`USING (true)` permissive SELECT policy van, ami mindent láthatóvá tesz.
-A `winmix_seasons` és `winmix_matches` táblákon emellett van egy verzió-szűrt
-policy is, de mivel mindkettő permissive, az eredményük OR kapcsolatú — a `true`
-policy miatt a korábbi/nem aktuális sorok is látszanak. A `winmix_pipeline_checkpoints`
-táblán csak a `true` policy van, így a teljes pipeline konfiguráció (calibration_t,
-ensemble weights, fit history) nyilvánosan olvasható.
+A `20260921000000_winmix_central_engine_v1.sql` migráció már eltávolította a
+`winmix_seasons`, `winmix_matches` és `winmix_pipeline_checkpoints` táblákon
+a `USING (true)` policy-ket, és helyettük verzió-szűrt policy-ket hozott létre.
+A live adatbázis ellenőrzése szerint ez a javítás érvényben van.
 
-**Megoldás:** A `USING (true)` policy-ket el kell távolítani. A `winmix_seasons`
-és `winmix_matches` táblákon ezáltal csak a verzió-szűrt policy marad. A
-`winmix_pipeline_checkpoints` táblán a `true` policy eltávolítása után csak a
-service-role lesz képes olvasni — ez a megfelelő viselkedés, mivel a pipeline
-konfiguráció belső adat, nem publikus.
+**Státusz:** Nincs teendő. Az alábbi DROP POLICY utasítások biztonságosak
+(idempotensek), de valószínűleg már nem találnak policy-t eltávolítani.
 
 ```sql
 -- =============================================================================
@@ -291,23 +285,146 @@ ORDER BY event_object_table, trigger_name;
 
 ---
 
+## 6. SECURITY DEFINER függvények EXECUTE jogosultságának korlátozása (kritikus)
+
+A Supabase Advisor azt jelezte, hogy a `winmix_claim_next_engine_job(p_worker text)`
+`SECURITY DEFINER` függvényt az `anon` és `authenticated` szerepkörök is
+meghívhatják. A `SECURITY DEFINER` függvények a létrehozó (általában egy RLS-t
+megkerülő) szerepkör nevében futnak. A Postgres alapértelmezés szerint minden
+új függvényre `EXECUTE` jogot ad a `PUBLIC` szerepkörnek, amiből az `anon` és
+`authenticated` örököl.
+
+Az eredeti migráció (`20260921000000`) tartalmaz egy `REVOKE ... FROM public`
+utasítást, de ez nem feltétlenül vonja vissza explicit módon az `anon` és
+`authenticated` szerepkörök jogait, ha azokat külön megkapta vagy ha a
+`PUBLIC`-tól való öröklés nem került explicit megszakításra.
+
+**Érintett függvények:**
+- `winmix_claim_next_engine_job(text)` — engine job claimelés (service-only)
+- `winmix_promote_engine_run(uuid)` — run promóció (service-only)
+- `winmix_validate_data_version(uuid)` — adatverzió validáció (service-only)
+- `winmix_requeue_expired_engine_jobs(integer)` — lejárt job újrakiszabása (service-only)
+
+**Megoldás:** Explicit `REVOKE EXECUTE` az `anon` és `authenticated`
+szerepköröktől, majd `GRANT EXECUTE` csak a `service_role`-nek.
+
+```sql
+-- =============================================================================
+-- 6. SECURITY DEFINER függvények EXECUTE jogainak korlátozása
+-- =============================================================================
+
+-- winmix_claim_next_engine_job
+REVOKE EXECUTE ON FUNCTION public.winmix_claim_next_engine_job(text)
+  FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.winmix_claim_next_engine_job(text)
+  TO service_role;
+
+-- winmix_promote_engine_run
+REVOKE EXECUTE ON FUNCTION public.winmix_promote_engine_run(uuid)
+  FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.winmix_promote_engine_run(uuid)
+  TO service_role;
+
+-- winmix_validate_data_version
+REVOKE EXECUTE ON FUNCTION public.winmix_validate_data_version(uuid)
+  FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.winmix_validate_data_version(uuid)
+  TO service_role;
+
+-- winmix_requeue_expired_engine_jobs
+REVOKE EXECUTE ON FUNCTION public.winmix_requeue_expired_engine_jobs(integer)
+  FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.winmix_requeue_expired_engine_jobs(integer)
+  TO service_role;
+
+NOTIFY pgrst, 'reload schema';
+```
+
+---
+
+## 7. Indexek felülvizsgálata (teljesítmény)
+
+A Supabase Performance Advisor 24 indexelatlan idegen kulcsot és 4
+duplikált indexpárt jelzett. Ezek nem biztonsági hibák, de lassíthatják a
+lekérdezéseket és feleslegesen növelik a tárhely- és írási költséget.
+
+**Duplikált indexek (winmix_matches tábla):**
+- `matches_league_idx` és `winmix_matches_league_idx` — mindkettő a `league`
+  oszlopon
+- `matches_home_team_idx` és `winmix_matches_home_team_idx` — mindkettő a
+  `home_team_id` oszlopon
+- `matches_away_team_idx` és `winmix_matches_away_team_idx` — mindkettő az
+  `away_team_id` oszlopon
+- `matches_kickoff_idx` és `winmix_matches_kickoff_idx` — mindkettő a
+  `kickoff_iso` oszlopon
+
+A duplikáció azért jött létre, mert a `20260904154245` migráció `matches_*`
+prefixű indexeket hozott létre, majd a `20260921000000` migráció `winmix_matches_*`
+prefixűeket. A korábbiak biztonságosan eltávolíthatók.
+
+```sql
+-- =============================================================================
+-- 7a. Duplikált indexek eltávolítása (a régebbi prefixűeket tartjuk meg)
+-- =============================================================================
+
+-- Először ellenőrizd, hogy tényleg duplikáltak:
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'public'
+  AND tablename = 'winmix_matches'
+  AND indexname IN (
+    'matches_league_idx', 'winmix_matches_league_idx',
+    'matches_home_team_idx', 'winmix_matches_home_team_idx',
+    'matches_away_team_idx', 'winmix_matches_away_team_idx',
+    'matches_kickoff_idx', 'winmix_matches_kickoff_idx'
+  )
+ORDER BY indexname;
+
+-- Ha mindkettő létezik, a régebbi prefixűeket el lehet távolítani:
+DROP INDEX IF EXISTS public.matches_league_idx;
+DROP INDEX IF EXISTS public.matches_home_team_idx;
+DROP INDEX IF EXISTS public.matches_away_team_idx;
+DROP INDEX IF EXISTS public.matches_kickoff_idx;
+```
+
+**Indexelatlan idegen kulcsok:** A Performance Advisor 24 FK oszlopot jelzett,
+ahol nincs index. Ezek közül a legfontosabbak (gyakran szűrt vagy joined
+oszlopok):
+- `winmix_match_features.match_id` — PK része, de külön index nem létezik
+- `winmix_predictions.match_id` — PK része, de külön index nem létezik
+- `winmix_team_state_snapshots.as_of_match_id` — ritkán szűrnek rá
+- `winmix_match_outcomes.match_id` — gyakran joined
+
+**Megjegyzés:** Az FK indexek hozzáadása előtt érdemes ellenőrizni a tényleges
+lekérdezési mintákat. A PK-vel rendelkező tábláknál (ahol a FK egyben PK része)
+a PK index már lefedi a hozzáférést. Csak azokat az FK oszlopokat kell indexelni,
+amelyek nem PK részei és gyakran szerepelnek WHERE vagy JOIN feltételben.
+
+---
+
 ## Futtatási sorrend
 
-1. **1. szkript** — RLS policy ütközések megszüntetése (azonnal, kritikus)
+1. **1. szkript** — RLS policy ütközések (már javítva, csak ellenőrzés)
 2. **2. szkript** — Veszélyes jogosultságok visszavonása (azonnal, kritikus)
 3. **3. szkript** — Trigger javítások (biztonságos, de fontos)
 4. **4. szkript** — Hiányzó V2 táblák létrehozása
 5. **5. szkript** — Ellenőrző lekérdezések lefuttatása
+6. **6. szkript** — SECURITY DEFINER EXECUTE korlátozása (azonnal, kritikus)
+7. **7. szkript** — Duplikált indexek eltávolítása (teljesítmény)
 
 ## Megjegyzések
 
-- Az 1. és 2. szkript **kritikus biztonsági javítások** — ezeket minél hamarabb
-  le kell futtatni.
-- A 3. szkript a `touch_updated_at` trigger hibáját oldja meg. Ha később
-  hozzáadják az `updated_at` oszlopot a `winmix_seasons` táblához, a trigger
-  újra létrehozható.
-- A 4. szkript három új táblát hoz létre, amelyek a V2 kiértékelési és
-  megbízhatósági funkciókhoz szükségesek.
+- A **6. szkript a legkritikusabb** — a `SECURITY DEFINER` függvények
+  nyilvánosan hívhatók, ami jogosultságnöveléssel futó kódot tesz elérhetővé
+  bárki számára, aki rendelkezik az anon kulccsal.
+- Az 1. szkript valószínűleg már nincs szükség — a central engine migráció
+  már elvégezte a policy cserét. A DROP POLICY utasítások biztonságosak.
+- A 2. szkript a `TRUNCATE`, `TRIGGER`, `REFERENCES` jogok visszavonása —
+  ezek közül a `TRUNCATE` a legveszélyesebb, mert az RLS nem védi.
+- A 3. szkript a `touch_updated_at` trigger hibáját oldja meg.
+- A 4. szkript három új táblát hoz létre a V2 kiértékelési funkciókhoz.
+- A 7. szkript opcionális, de ajánlott — a duplikált indexek felesleges
+  tárhely- és írási költséget okoznak.
 - A `winmix_match_outcomes` tábla már létezik a live DB-ben, de eltérő sémával
   (`id` PK + `version` oszlop), mint amit az eredeti migrációs dokumentum írt.
   A `prediction_outcome_links` tábla FK-ja ezért az `id` oszlopra mutat.
