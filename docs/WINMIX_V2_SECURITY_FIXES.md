@@ -9,13 +9,19 @@ tartalmazza. A szkripteket a Supabase SQL Editorban kell lefuttatni.
 
 ## 1. RLS policy ütközések megszüntetése
 
-A `winmix_seasons` és `winmix_matches` táblákon két permissive SELECT policy
-van: az egyik csak az aktuális, lezárt verziót engedné, a másik `USING (true)`
-viszont mindent láthatóvá tesz. Mivel mindkettő permissive, az eredményük OR
-kapcsolatú — a `true` policy miatt a korábbi/nem aktuális sorok is látszanak.
+A `winmix_seasons`, `winmix_matches` és `winmix_pipeline_checkpoints` táblákon
+`USING (true)` permissive SELECT policy van, ami mindent láthatóvá tesz.
+A `winmix_seasons` és `winmix_matches` táblákon emellett van egy verzió-szűrt
+policy is, de mivel mindkettő permissive, az eredményük OR kapcsolatú — a `true`
+policy miatt a korábbi/nem aktuális sorok is látszanak. A `winmix_pipeline_checkpoints`
+táblán csak a `true` policy van, így a teljes pipeline konfiguráció (calibration_t,
+ensemble weights, fit history) nyilvánosan olvasható.
 
-**Megoldás:** A `USING (true)` policy-ket el kell távolítani, így csak a
-verzió-szűrt policy marad érvényben.
+**Megoldás:** A `USING (true)` policy-ket el kell távolítani. A `winmix_seasons`
+és `winmix_matches` táblákon ezáltal csak a verzió-szűrt policy marad. A
+`winmix_pipeline_checkpoints` táblán a `true` policy eltávolítása után csak a
+service-role lesz képes olvasni — ez a megfelelő viselkedés, mivel a pipeline
+konfiguráció belső adat, nem publikus.
 
 ```sql
 -- =============================================================================
@@ -27,6 +33,13 @@ DROP POLICY IF EXISTS winmix_seasons_read_all ON public.winmix_seasons;
 -- 1b. winmix_matches: távolítsuk el a USING(true) policy-t
 -- =============================================================================
 DROP POLICY IF EXISTS winmix_matches_read_all ON public.winmix_matches;
+
+-- =============================================================================
+-- 1c. winmix_pipeline_checkpoints: távolítsuk el a USING(true) policy-t
+--     A pipeline konfiguráció (calibration_t, ensemble weights, fit history)
+--     belső adat, nem kell publikusnak lennie.
+-- =============================================================================
+DROP POLICY IF EXISTS winmix_checkpoints_read_all ON public.winmix_pipeline_checkpoints;
 
 NOTIFY pgrst, 'reload schema';
 ```
@@ -234,11 +247,11 @@ A javítások futtatása után ellenőrizd az eredményeket:
 
 ```sql
 -- 5a. RLS policy-k ellenőrzése (nem szabad USING(true) policy-t látni
---     a winmix_seasons és winmix_matches táblákon)
+--     a winmix_seasons, winmix_matches és winmix_pipeline_checkpoints táblákon)
 SELECT tablename, policyname, cmd, qual
 FROM pg_policies
 WHERE schemaname = 'public'
-  AND tablename IN ('winmix_seasons', 'winmix_matches')
+  AND tablename IN ('winmix_seasons', 'winmix_matches', 'winmix_pipeline_checkpoints')
 ORDER BY tablename, policyname;
 
 -- 5b. Veszélyes jogosultságok ellenőrzése (nem szabad TRUNCATE/TRIGGER/REFERENCES
