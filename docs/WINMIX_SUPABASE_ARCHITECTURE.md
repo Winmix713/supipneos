@@ -1,12 +1,19 @@
 # WinMix ↔ Supabase Architektúra Dokumentáció
 
-> **Dátum:** 2026-09-23 (utolsó revízió: 2026-09-23)
+> **Dátum:** 2026-09-23 (utolsó revízió: 2026-09-24)
 > **Cél:** A WinMix rendszer és a Supabase közötti kapcsolatok teljes körű dokumentálása, a jelenlegi architektúra teljesítményproblémáinak elemzése, és konkrét optimalizálási javaslatok.
 >
 > **Revíziós megjegyzések (2026-09-23):**
 > - A teljes történeti pipeline helyi vagy tartós workerben fut, NEM Edge Function-ben. Az Edge Function kérésbefogadásra, rövid adminműveletre és státuszkezelésre való.
 > - Az előre számított H2H/liga/tabella/kalibrációs aggregációk a Forduló Prediktor után következnek — nem blokkolják az első működő átadást.
 > - A fixture-predikciós táblák és a winmix-fixture-request forrása elkészült, de az Edge Function nincs deployolva — nem kész funkció, amíg a worker és a felület össze nincs kötve.
+>
+> **Revíziós megjegyzések (2026-09-24) — séma- és RLS-korrekciók a tényleges adatbázis-kép alapján:**
+> - Az RLS nyitottabb, mint a korábbi dokumentum állította: `winmix_seasons`, `winmix_matches`, `winmix_teams` és `winmix_pipeline_checkpoints` táblákon `USING (true)` permissive SELECT policy van, amely felülírja a current+sealed verziószűrést.
+> - A `winmix_pipeline_checkpoints` tábla **nem run-scoped**: elsődleges kulcsa `league`, nincs `data_version_id`, `run_id` vagy `parameter_snapshot_id` oszlopa. A reprodukálhatóságot a `winmix_fixture_prediction_requests` tábla `source_run_id + data_version_id + parameter_snapshot_id` hármas rögzítése biztosítja.
+> - A `winmix_teams` tábla **ligához kötődik**, nem adatverzióhoz — nincs `data_version_id` oszlopa.
+> - Több tábla oszlopneve és sémája eltér a korábbi dokumentációtól (lásd 8. szakasz korrekcióit).
+> - A policy-lista önmagában nem bizonyítja a tényleges anon/authenticated olvasási hozzáférést — ehhez a GRANT SELECT és az RLS engedélyezettsége is ellenőrizendő.
 
 ---
 
@@ -109,10 +116,10 @@ A rendszer két párhuzamos sémát tartalmaz:
 
 | Tábla | Cél | Böngésző hozzáférés |
 |-------|-----|---------------------|
-| `winmix_teams` | Csapatok (liga, canonical_key, súlyindex) | SELECT (current version) |
-| `winmix_seasons` | Szezonok (verzióhoz kötött) | SELECT (current version) |
-| `winmix_matches` | Mérkőzések (generated columns: total_goals, btts, outcome) | SELECT (current version) |
-| `winmix_pipeline_checkpoints` | Diagnosztikai archívum | **Nincs hozzáférés** |
+| `winmix_teams` | Csapatok (ligához kötött, nincs data_version_id) | SELECT (read_all, using=true) |
+| `winmix_seasons` | Szezonok (verzióhoz kötött) | SELECT (current+sealed **és** read_all, using=true) |
+| `winmix_matches` | Mérkőzések (generated columns: total_goals, btts, outcome) | SELECT (current+sealed **és** read_all, using=true) |
+| `winmix_pipeline_checkpoints` | Diagnosztikai archívum (PK=league, nem run-scoped) | SELECT (read_all, using=true) — **biztonsági kockázat** |
 | `winmix_data_versions` | Adatverziók (draft/sealed/superseded/rejected) | SELECT (is_current + sealed) |
 | `winmix_parameter_snapshots` | Paraméter-pillanatképek (model verzió, súlyok) | **Nincs hozzáférés** |
 | `winmix_engine_jobs` | Job queue (queued/running/succeeded/failed) | **Nincs hozzáférés** |
@@ -128,24 +135,30 @@ A rendszer két párhuzamos sémát tartalmaz:
 
 ### 3.2. RLS architektúra
 
-**Alapelv:** deny-by-default, service-role az egyetlen író.
+**Alapelv:** deny-by-default, service-role az egyetlen író — de a gyakorlatban az RLS nyitottabb, mint ez az elv sugallja.
 
 - Minden új táblán engedélyezve van az RLS
-- SELECT policy-k: `using(is_current AND status = 'sealed/succeeded/published')` — csak a jelenlegi publikált verzió látható
 - **Nincsenek INSERT/UPDATE/DELETE policy-k** anon/authenticated szerepkörökre — a service_role (RLS bypass) az egyetlen író
-- `winmix_pipeline_checkpoints`, `parameter_snapshots`, `engine_jobs`, `import_batches` — **minden hozzáférés revoked** anon/authenticated-től
+- **A `winmix_seasons` és `winmix_matches` táblákon KÉT permissive SELECT policy van:** egy `current_version_read` (current+sealed szűrés) **és** egy `read_all` (`using=true`). Mivel a permissive policy-k OR kapcsolatban érvényesülnek, a `read_all` felülírja a verziószűrést — minden szezon és meccs olvasható.
+- **A `winmix_teams` táblán `winmix_teams_read_all` (`using=true`)** — a csapatok nincsenek verziószűrésre korlátozva (nem is lehetnek, mert a táblának nincs `data_version_id` oszlopa).
+- **A `winmix_pipeline_checkpoints` táblán `winmix_checkpoints_read_all` (`using=true`)** — a korábbi állítással ellentétben a checkpointok **publikusan olvashatóak**, nem revoked. Ez biztonsági kockázat, mert a tábla belső modellállapotot tartalmaz (`m1_fit`, `calib_history`, `fit_history` jsonb mezők). Nem blokkolja a Prediktort, de később le kell zárni.
+- A `winmix_parameter_snapshots`, `winmix_engine_jobs`, `winmix_import_batches` táblákon nincs SELECT policy a policy-listában — ezekre valóban nincs publikus olvasási hozzáférés.
 - `view_team_ratings` — `security_invoker = true`, így a base tábla RLS érvényesül
 - SECURITY DEFINER függvények: `winmix_claim_next_engine_job`, `winmix_promote_engine_run`, `winmix_validate_data_version`, `winmix_requeue_expired_engine_jobs` — mind csak `service_role` számára
 
+> **Jogosultsági megjegyzés:** A policy-lista önmagában nem bizonyítja a tényleges anon/authenticated olvasási hozzáférést. Ehhez ellenőrizni kell, hogy az RLS engedélyezve van-e, és hogy az adott szerepkörnek van-e táblaszintű `GRANT SELECT` jogosultsága. RLS korlátozza a sorokat, de a GRANT szabályozza, hogy a szerepkör egyáltalán hozzáférhet-e a táblához.
+
 ### 3.3. Integrity védelem
 
-- **Generated columns:** `total_goals`, `btts`, `outcome` — inkonzisztens sorok nem illeszthetők be
-- **Constraints:** `ht_le_ft` (félidő ≤ teljes idő), `home_team_id <> away_team_id`, pontszám ≤ 20
-- `winmix_prediction_probability_sum`: `abs((home+draw+away) - 1.0) <= 0.000001`
-- `winmix_current_run_must_succeed`: sikertelen futás sosem lehet `is_current`
-- `winmix_one_current_data_version`: pontosan egy current verzió
-- `winmix_one_current_engine_run`: pontosan egy current run
+- **Generated columns:** `total_goals`, `btts`, `outcome` — a séma alapján jelen vannak, de a tényleges generated column definíciók ellenőrzendő
+- **Constraints:** `ht_le_ft` (félidő ≤ teljes idő), `home_team_id <> away_team_id`, pontszám ≤ 20 — a sémarészletből a CHECK constraint nevek nem igazolhatók, csak az oszlopszintű feltételek látszanak
+- `winmix_prediction_probability_sum`: `abs((outcome_home+outcome_draw+outcome_away) - 1.0) <= 0.000001` — a constraint neve és pontos definíciója ellenőrzendő
+- `winmix_current_run_must_succeed`: sikertelen futás sosem lehet `is_current` — ellenőrzendő
+- `winmix_one_current_data_version`: pontosan egy current verzió — ellenőrzendő
+- `winmix_one_current_engine_run`: pontosan egy current run — ellenőrzendő
 - **Content fingerprint:** md5 a kanonikus sorrendű match sorokon — verzió integritás
+
+> **Megjegyzés (2026-09-24):** A rendelkezésre álló séma- és RLS-adatokból az oszlopok, típusok és policyk ellenőrizhetők, de a CHECK constraint-ek definíciói és nevei nem. Ezeket csak a tényleges constraint-definíciók ellenőrzése után szabad tényként feltüntetni.
 
 ### 3.4. Concurrency-safe job queue
 
@@ -453,7 +466,7 @@ CREATE INDEX idx_predictions_run_match
 ### 7.1. Erősségek
 
 1. **Szigorú read-only public surface** — minden publikus táblán csak SELECT policy; nincsenek INSERT/UPDATE/DELETE policy-k
-2. **Current-run gating** — a motor kimenetek csak `is_current + succeeded` után láthatók
+2. **Current-run gating** — a motor kimenetek csak `is_current + succeeded` után láthatók — **de** a `winmix_seasons`, `winmix_matches`, `winmix_teams` és `winmix_pipeline_checkpoints` táblákon `USING (true)` permissive policy is van, amely felülírja a verziószűrést (lásd 3.2)
 3. **Integrity-by-construction** — generated columns és constraint-ek megakadályozzák az inkonzisztens adatokat
 4. **Concurrency-safe job queue** — `FOR UPDATE SKIP LOCKED` + lease
 5. **Single promotion point** — `winmix_promote_engine_run` az egyetlen hely az `is_current` váltásra
@@ -480,9 +493,11 @@ CREATE INDEX idx_predictions_run_match
 | league | text | Liga (angol/spanyol) |
 | canonical_key | text | Kanonikus kulcs |
 | display_name | text | Megjelenítendő név |
-| weight_index | numeric(4,1) | Súlyindex (0-10, default 5.0) |
+| weight_index | numeric | Súlyindex (0-10, default 5.0) |
 | weight_source | text | Súlyforrás (auto/manual) |
-| data_version_id | uuid | Verzió kötés |
+| updated_at | timestamptz | Frissítés időpontja |
+
+> **Korrekció (2026-09-24):** A `data_version_id` oszlop **nem létezik** a tényleges sémában. A csapatok ligához kötődnek, nem adatverzióhoz.
 
 #### winmix_seasons
 | Oszlop | Típus | Leírás |
@@ -502,19 +517,25 @@ CREATE INDEX idx_predictions_run_match
 |--------|-------|--------|
 | id | uuid PK | Egyedi azonosító |
 | season_id | uuid FK | Szezon |
-| match_no | int | Meccs sorszáma |
 | league | text | Liga |
+| match_no | int | Meccs sorszáma |
+| source_file_id | text (nullable) | Forrásfájl azonosító |
+| row_index | int (nullable) | Sor index |
+| kickoff_iso | timestamptz (nullable) | Kezdés időpontja (ISO) |
+| match_date_raw | text (nullable) | Nyers dátum szöveg |
 | home_team_id | uuid FK | Hazai csapat |
 | away_team_id | uuid FK | Vendég csapat |
+| ht_home_score | int (nullable) | Félidő hazai |
+| ht_away_score | int (nullable) | Félidő vendég |
 | home_score | int | Hazai gólok |
 | away_score | int | Vendég gólok |
-| ht_home_score | int | Félidő hazai |
-| ht_away_score | int | Félidő vendég |
-| kickoff | text | Kezdés időpontja |
-| total_goals | int (generated) | Összes gól |
-| btts | bool (generated) | Mindkét csapat szerzett |
-| outcome | text (generated) | Eredmény (H/A/D) |
+| total_goals | int (nullable) | Összes gól |
+| btts | bool (nullable) | Mindkét csapat szerzett |
+| outcome | text (nullable) | Eredmény (H/A/D) |
+| created_at | timestamptz | Létrehozás időpontja |
 | data_version_id | uuid | Verzió kötés |
+
+> **Korrekció (2026-09-24):** `kickoff` helyett `kickoff_iso timestamptz` + `match_date_raw text`. Új oszlopok: `source_file_id`, `row_index`, `created_at`.
 
 #### view_team_ratings
 - SQL tükör a `computeAutoTeamWeights()` logikának
@@ -523,6 +544,29 @@ CREATE INDEX idx_predictions_run_match
 
 ### 8.2. Engine táblák (Family 2)
 
+#### winmix_pipeline_checkpoints
+
+> **Korrekció (2026-09-24):** A tábla **nem run-scoped**. Elsődleges kulcsa `league`, nincs `data_version_id`, `run_id` vagy `parameter_snapshot_id` oszlopa. Ezért önmagában nem reprodukálható jövőbeli predikció forrása. A reprodukálhatóságot a `winmix_fixture_prediction_requests` tábla `source_run_id + data_version_id + parameter_snapshot_id` hármas rögzítése biztosítja. A checkpointot később run-szintűvé kell bővíteni (új migráció).
+
+| Oszlop | Típus | Leírás |
+|--------|-------|--------|
+| league | text PK | Liga (elsődleges kulcs) |
+| feature_schema_version | int | Feature séma verzió |
+| processed_match_count | int | Feldolgozott meccsek száma |
+| prefix_signature | text | Prefix aláírás |
+| weights_signature | text | Súly aláírás |
+| experiments_key | text | Kísérlet kulcs |
+| history_scope | text | season-only / league-cumulative |
+| calibration_t | numeric (nullable) | Kalibrációs hőmérséklet |
+| ensemble_w_m1 | numeric (nullable) | Ensemble M1 súly |
+| ensemble_tuned | bool (nullable) | Ensemble hangolva |
+| m1_fit | jsonb (nullable) | M1 illesztés (belső modellállapot) |
+| calib_history | jsonb (nullable) | Kalibrációs történet (belső modellállapot) |
+| fit_history | jsonb (nullable) | Illesztési történet (belső modellállapot) |
+| saved_at | timestamptz | Mentés időpontja |
+
+> **Biztonsági megjegyzés:** A `m1_fit`, `calib_history` és `fit_history` jsonb mezők belső modellállapotot tartalmaznak. A `winmix_checkpoints_read_all` (`using=true`) policy miatt ezek publikusan olvashatóak. Nem blokkolja a Prediktort, de később le kell zárni.
+
 #### winmix_data_versions
 | Oszlop | Típus | Leírás |
 |--------|-------|--------|
@@ -530,9 +574,15 @@ CREATE INDEX idx_predictions_run_match
 | version_key | text unique | Verzió kulcs |
 | status | text | draft/sealed/superseded/rejected |
 | is_current | bool | Jelenlegi verzió |
-| content_fingerprint | text | Tartalmi ujjlenyomat |
+| expected_matches_per_season | int | Várt meccsek/szezon (default 240) |
+| league_coverage | jsonb | Liga lefedettség |
 | season_count | int | Szezonok száma |
 | match_count | int | Meccsek száma |
+| content_fingerprint | text (nullable) | Tartalmi ujjlenyomat |
+| source_description | text (nullable) | Forrás leírás |
+| sealed_at | timestamptz (nullable) | Lezárás időpontja |
+| created_at | timestamptz | Létrehozás időpontja |
+| updated_at | timestamptz | Frissítés időpontja |
 
 #### winmix_parameter_snapshots
 | Oszlop | Típus | Leírás |
@@ -542,10 +592,13 @@ CREATE INDEX idx_predictions_run_match
 | model_version | text | Modell verzió |
 | feature_schema_version | int | Feature séma verzió |
 | pipeline_contract_version | int | Pipeline contract verzió |
-| parameters_fingerprint | text (generated md5) | Paraméter ujjlenyomat |
+| history_scope | text | season-only / league-cumulative |
 | experiments | jsonb | Kísérletek |
 | weights | jsonb | Súlyok |
+| manual_weight_overrides | jsonb | Kézi súly-felülbírálások |
 | settings | jsonb | Beállítások |
+| parameters_fingerprint | text (nullable, generated md5) | Paraméter ujjlenyomat |
+| created_at | timestamptz | Létrehozás időpontja |
 
 #### winmix_engine_jobs
 | Oszlop | Típus | Leírás |
@@ -564,12 +617,19 @@ CREATE INDEX idx_predictions_run_match
 | Oszlop | Típus | Leírás |
 |--------|-------|--------|
 | id | uuid PK | Egyedi azonosító |
-| job_id | uuid FK | Job |
+| job_id | uuid FK (nullable, unique) | Job |
+| data_version_id | uuid FK | Adatverzió kötés |
+| parameter_snapshot_id | uuid FK | Paraméter-pillanatkép kötés |
+| engine_version | text | Motor verzió |
 | status | text | running/succeeded/failed/cancelled |
 | is_current | bool | Jelenlegi futás |
 | input_fingerprint | text | Bemenet ujjlenyomat |
+| started_at | timestamptz | Indítás időpontja |
+| finished_at | timestamptz (nullable) | Befejezés időpontja |
+| duration_ms | bigint (nullable) | Futás idő (ms) |
 | result_summary | jsonb | Eredmény összesítés |
-| duration_ms | int | Futás idő (ms) |
+| error_code | text (nullable) | Hibakód |
+| error_message | text (nullable) | Hibaüzenet |
 
 #### winmix_match_features
 | Oszlop | Típus | Leírás |
@@ -577,7 +637,9 @@ CREATE INDEX idx_predictions_run_match
 | run_id | uuid FK | Futás |
 | match_id | uuid FK | Meccs |
 | sequence_no | int | Sorszám |
+| feature_schema_version | int | Feature séma verzió |
 | features | jsonb | Feature vektor |
+| created_at | timestamptz | Létrehozás időpontja |
 | PK: (run_id, match_id) | | |
 
 #### winmix_predictions
@@ -585,16 +647,19 @@ CREATE INDEX idx_predictions_run_match
 |--------|-------|--------|
 | run_id | uuid FK | Futás |
 | match_id | uuid FK | Meccs |
-| home_prob | numeric(12,10) | Hazai győzelem valószínűség |
-| draw_prob | numeric(12,10) | Döntetlen valószínűség |
-| away_prob | numeric(12,10) | Vendég győzelem valószínűség |
-| lambda_home | numeric | Hazai gólvárható |
-| lambda_away | numeric | Vendég gólvárható |
-| confidence | numeric | Konfidencia |
+| outcome_home | numeric | Hazai győzelem valószínűség |
+| outcome_draw | numeric | Döntetlen valószínűség |
+| outcome_away | numeric | Vendég győzelem valószínűség |
+| lambda_home | numeric (nullable) | Hazai gólvárható |
+| lambda_away | numeric (nullable) | Vendég gólvárható |
+| confidence | numeric (nullable) | Konfidencia |
 | recommendation | jsonb | Ajánlás |
 | markets | jsonb | Piaci opciók |
 | model_output | jsonb | Modell kimenet |
+| created_at | timestamptz | Létrehozás időpontja |
 | Constraint: probabilities sum to 1.0 | | |
+
+> **Korrekció (2026-09-24):** Az oszlopok nevei `outcome_home`, `outcome_draw`, `outcome_away` — NEM `home_prob`, `draw_prob`, `away_prob`.
 
 #### winmix_calibration_results
 | Oszlop | Típus | Leírás |
@@ -602,9 +667,13 @@ CREATE INDEX idx_predictions_run_match
 | run_id | uuid FK | Futás |
 | league | text | Liga |
 | market_code | text | Piaci kód |
-| brier | numeric | Brier score |
-| log_loss | numeric | Log loss |
-| ece | numeric | Expected Calibration Error |
+| sample_count | int | Mintaméret |
+| brier | numeric (nullable) | Brier score |
+| log_loss | numeric (nullable) | Log loss |
+| ece | numeric (nullable) | Expected Calibration Error |
+| metrics | jsonb | További metrikák |
+| created_at | timestamptz | Létrehozás időpontja |
+| PK: (run_id, league, market_code) | | |
 
 ### 8.3. Fixture predikció táblák
 
@@ -615,11 +684,21 @@ CREATE INDEX idx_predictions_run_match
 | idempotency_key | uuid unique | Idempotens kulcs |
 | input_hash | text unique | Bemenet hash |
 | league | text | Liga |
-| cutoff_at | timestamptz | Cutoff időpont |
+| cutoff_at | timestamptz (nullable) | Cutoff időpont |
 | source_run_id | uuid FK | Forrás futás |
-| status | text | queued/running/sealed/ready/published/failed |
+| data_version_id | uuid FK | Adatverzió kötés |
+| parameter_snapshot_id | uuid FK | Paraméter-pillanatkép kötés |
 | request_payload | jsonb | Kérés payload |
-| published_at | timestamptz | Publikálás időpontja |
+| status | text | queued/running/sealed/ready/published/failed/cancelled |
+| claimed_at | timestamptz (nullable) | Claim időpontja |
+| claimed_by | text (nullable) | Claimelő |
+| published_at | timestamptz (nullable) | Publikálás időpontja |
+| error_code | text (nullable) | Hibakód |
+| error_message | text (nullable) | Hibaüzenet |
+| created_at | timestamptz | Létrehozás időpontja |
+| updated_at | timestamptz | Frissítés időpontja |
+
+> **Korrekció (2026-09-24):** A `source_run_id` mellett `data_version_id` és `parameter_snapshot_id` is szerepel. Ez a hármás biztosítja a reprodukálhatóságot — a worker nem egyetlen „aktuális checkpointot" használ vakon, hanem minden 1–16 párosítási kérésnél rögzíti a konkrét forrás-run-t, adatverziót és paraméter-snapshotot.
 
 #### winmix_fixture_prediction_cards
 | Oszlop | Típus | Leírás |
@@ -638,8 +717,10 @@ CREATE INDEX idx_predictions_run_match
 | request_id | uuid FK | Kérés |
 | selection_kind | text | core/joker |
 | slot_no | int | Hely sorszám (1-3) |
-| card_id | uuid | Kártya |
-| market_key | text | Piaci kulcs |
+| card_id | uuid (nullable) | Kártya |
+| market_key | text (nullable) | Piaci kulcs |
+| selection_trace | jsonb | Kiválasztási nyom |
+| created_at | timestamptz | Létrehozás időpontja |
 | PK: (request_id, selection_kind, slot_no) | | |
 
 ---
