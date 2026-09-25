@@ -5,3 +5,6 @@ verify_jwt = true
 
 [functions.winmix-engine]
 verify_jwt = true
+
+[functions.winmix-fixture-request]
+verify_jwt = true

@@ -237,7 +237,11 @@ Deno.serve(async (request) => {
   const url = Deno.env.get('SUPABASE_URL') ?? '';
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
   if (!url || !serviceRoleKey) return json({ error: 'Missing Supabase server configuration' }, 500);
-  const admin = createClient(url, serviceRoleKey, { auth: { autoRefreshToken: false, persistSession: false } });
+  const admin = createClient(url, serviceRoleKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+    db: { schema: 'public' },
+    global: { headers: { 'x-client-info': 'winmix-engine@edge' } },
+  });
 
   const { error: recoveryError } = await admin.rpc('winmix_requeue_expired_engine_jobs', { p_lease_seconds: 1800 });
   if (recoveryError) return json({ error: `Expired-job recovery failed: ${recoveryError.message}` }, 500);
